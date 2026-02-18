@@ -69,6 +69,9 @@ class LaunchSession:
         self._proc_output = ActiveIoHandler()
         self._owns_service = True
 
+        self._callback_error = None
+        self._has_run = False
+
         self._wrapped_ld = self._wrap_launch_description(launch_description)
 
     @classmethod
@@ -79,6 +82,8 @@ class LaunchSession:
         session._proc_info = ActiveProcInfoHandler()
         session._proc_output = ActiveIoHandler()
         session._owns_service = False
+        session._callback_error = None
+        session._has_run = False
         session._wrapped_ld = None
         return session
 
@@ -139,6 +144,13 @@ class LaunchSession:
                 'The external LaunchService owns the event loop.'
             )
 
+        if self._has_run:
+            raise RuntimeError(
+                'run() has already been called on this session. '
+                'Create a new LaunchSession to run again.'
+            )
+        self._has_run = True
+
         self._launch_service.include_launch_description(self._wrapped_ld)
 
         if on_ready is not None:
@@ -147,31 +159,32 @@ class LaunchSession:
             )
             thread.start()
 
-        return self._launch_service.run(
+        exit_code = self._launch_service.run(
             shutdown_when_idle=shutdown_when_idle
         )
+
+        if self._callback_error is not None:
+            raise self._callback_error
+
+        return exit_code
 
     def _run_callback(self, on_ready):
         """Run the on_ready callback, ensuring shutdown on completion."""
         try:
             on_ready(self)
+        except Exception as e:
+            self._callback_error = e
         finally:
             self.shutdown()
 
-    def shutdown(self, *, reason='session complete'):
+    def shutdown(self):
         """
         Shut down the launch session.
 
         Thread-safe. Triggers LaunchService's existing SIGINT → SIGTERM → SIGKILL
         escalation for all managed processes. Idempotent.
-
-        :param reason: Human-readable shutdown reason (for logging).
         """
-        ret = self._launch_service.shutdown()
-        if ret is not None:
-            # shutdown() returned a coroutine (called from within the event loop),
-            # but we don't await it here — LaunchService handles it internally
-            pass
+        self._launch_service.shutdown()
 
     def wait_for_startup(self, process, *, timeout=10):
         """
@@ -247,7 +260,8 @@ class LaunchSession:
 
         On context exit, calls ``shutdown()`` if processes are still running.
 
-        :param launch_service: An already-running LaunchService.
+        :param launch_service: A LaunchService instance (caller is responsible
+            for running it, typically on another thread).
         :param launch_description: The LaunchDescription to manage.
         :yields: A LaunchSession instance.
         """
